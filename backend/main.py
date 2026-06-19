@@ -13,7 +13,6 @@ import json
 load_dotenv()
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 supabase = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_SERVICE_KEY")
