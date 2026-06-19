@@ -9,78 +9,15 @@ from dotenv import load_dotenv
 from groq import Groq
 from supabase import create_client
 import json
-import chromadb
-from chromadb.utils import embedding_functions
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 load_dotenv()
 
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 supabase = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_SERVICE_KEY")
 )
-
-# ── RAG Setup (ChromaDB + LangChain) ────────────────
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
-embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="all-MiniLM-L6-v2"
-)
-
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=800,
-    chunk_overlap=150,
-    separators=["\n\n", "\n", ". ", " ", ""]
-)
-
-def get_or_create_collection(paper_id: str):
-    """Get or create a ChromaDB collection for a specific paper"""
-    collection_name = f"paper_{paper_id.replace('-', '_')}"
-    return chroma_client.get_or_create_collection(
-        name=collection_name,
-        embedding_function=embedding_fn
-    )
-
-def index_paper_text(paper_id: str, text: str):
-    """Split paper text into chunks and store embeddings in ChromaDB"""
-    collection = get_or_create_collection(paper_id)
-
-    # Clear existing chunks if re-indexing
-    existing = collection.get()
-    if existing and existing.get("ids"):
-        collection.delete(ids=existing["ids"])
-
-    chunks = text_splitter.split_text(text)
-    if not chunks:
-        return 0
-
-    ids = [f"{paper_id}_chunk_{i}" for i in range(len(chunks))]
-    collection.add(
-        documents=chunks,
-        ids=ids,
-        metadatas=[{"paper_id": paper_id, "chunk_index": i} for i in range(len(chunks))]
-    )
-    return len(chunks)
-
-def retrieve_relevant_chunks(paper_id: str, query: str, top_k: int = 4):
-    """Retrieve the most relevant chunks for a query from a single paper"""
-    try:
-        collection = get_or_create_collection(paper_id)
-        results = collection.query(query_texts=[query], n_results=top_k)
-        if results and results.get("documents") and results["documents"][0]:
-            return results["documents"][0]
-        return []
-    except Exception:
-        return []
-
-def retrieve_relevant_chunks_multi(paper_ids: list, query: str, top_k_per_paper: int = 2):
-    """Retrieve relevant chunks across multiple papers"""
-    all_chunks = []
-    for pid in paper_ids:
-        chunks = retrieve_relevant_chunks(pid, query, top_k_per_paper)
-        for c in chunks:
-            all_chunks.append({"paper_id": pid, "text": c})
-    return all_chunks
 
 app = FastAPI(title="ScholarAI API")
 
@@ -264,13 +201,6 @@ Paper:
             "status": "processed"
         }).eq("id", paper_id).execute()
 
-        # Index paper into vector database for RAG-based chat
-        try:
-            chunk_count = index_paper_text(paper_id, text)
-            print(f"Indexed {chunk_count} chunks for paper {paper_id}")
-        except Exception as idx_err:
-            print(f"Indexing error (non-fatal): {idx_err}")
-
         return {"success": True, "paper_id": paper_id, "novelty_score": novelty_score}
 
     except Exception as e:
@@ -292,31 +222,22 @@ async def chat_with_paper(req: ChatRequest):
             "title, extracted_text, summary, key_findings, methodology"
         ).eq("id", req.paper_id).single().execute()
         paper = result.data
-
-        # RAG: Retrieve only the most relevant chunks for this question
-        relevant_chunks = retrieve_relevant_chunks(req.paper_id, req.message, top_k=4)
-
-        if relevant_chunks:
-            retrieved_context = "\n\n---\n\n".join(relevant_chunks)
-        else:
-            # Fallback if paper not indexed yet
-            retrieved_context = (paper.get("extracted_text") or paper.get("summary") or "")[:6000]
+        context = paper.get("extracted_text") or paper.get("summary") or ""
 
         messages = [{
             "role": "system",
-            "content": f"""You are an expert AI research assistant analyzing this specific paper using retrieval-augmented context.
+            "content": f"""You are an expert AI research assistant analyzing this specific paper:
 
 Title: {paper.get('title', '')}
-Key Findings: {paper.get('key_findings', '')[:400]}
-
-Most relevant excerpts retrieved for this question:
-{retrieved_context}
+Key Findings: {paper.get('key_findings', '')[:500]}
+Methodology: {paper.get('methodology', '')[:300]}
+Content: {context[:6000]}
 
 Guidelines:
-- Answer accurately based ONLY on the retrieved excerpts and key findings above
-- If the answer isn't in the retrieved content, clearly say so
+- Answer accurately based on paper content only
+- If not in paper, clearly say so
 - Use technical language appropriate for researchers
-- Provide specific details, numbers, examples from the excerpts
+- Provide specific details, numbers, examples from paper
 - Be concise but complete"""
         }]
 
@@ -335,8 +256,6 @@ Guidelines:
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ── 3. Multi Paper Chat ─────────────────────────────
 class MultiChatRequest(BaseModel):
     paper_ids: List[str]
     message: str
@@ -345,40 +264,37 @@ class MultiChatRequest(BaseModel):
 @app.post("/multi-chat")
 async def multi_paper_chat(req: MultiChatRequest):
     try:
-        paper_titles_map = {}
+        papers_context = ""
+        paper_titles = []
+
         for pid in req.paper_ids[:10]:
-            result = supabase.table("papers").select("title").eq("id", pid).single().execute()
-            if result.data:
-                paper_titles_map[pid] = result.data.get("title", "Unknown")
-
-        # RAG: Retrieve relevant chunks from each paper based on the question
-        retrieved = retrieve_relevant_chunks_multi(list(paper_titles_map.keys()), req.message, top_k_per_paper=3)
-
-        retrieved_context = ""
-        for item in retrieved:
-            title = paper_titles_map.get(item["paper_id"], "Unknown Paper")
-            retrieved_context += f"\n\n=== From: {title} ===\n{item['text']}"
-
-        if not retrieved_context:
-            retrieved_context = "No indexed content found. Papers may not be fully analyzed yet."
+            result = supabase.table("papers").select(
+                "title, extracted_text, summary, key_findings"
+            ).eq("id", pid).single().execute()
+            p = result.data
+            if p:
+                paper_titles.append(p.get("title", "Unknown"))
+                context = p.get("extracted_text") or p.get("summary") or ""
+                papers_context += f"\n\n=== PAPER: {p.get('title')} ===\n"
+                papers_context += f"Key Findings: {p.get('key_findings', '')[:500]}\n"
+                papers_context += f"Content: {context[:2000]}\n"
 
         messages = [{
             "role": "system",
-            "content": f"""You are an expert AI research assistant analyzing {len(paper_titles_map)} research papers simultaneously using retrieval-augmented context.
+            "content": f"""You are an expert AI research assistant analyzing {len(req.paper_ids)} research papers simultaneously.
 
 Papers available:
-{chr(10).join(f"[{i+1}] {t}" for i, t in enumerate(paper_titles_map.values()))}
+{chr(10).join(f"[{i+1}] {t}" for i, t in enumerate(paper_titles))}
 
-Most relevant excerpts retrieved across these papers for this question:
-{retrieved_context[:10000]}
+Papers Content:
+{papers_context[:10000]}
 
 Guidelines:
-- Answer based on the retrieved excerpts above
-- When comparing, clearly mention which paper says what
+- Answer based on ALL papers provided
+- When comparing, clearly mention which paper says what using [Paper Title] or [1], [2] format
 - Identify common themes and differences
 - Be specific and cite paper titles in answers
-- If asked to compare, provide detailed structured comparison
-- If the retrieved excerpts don't cover something, say so clearly"""
+- If asked to compare, provide detailed structured comparison"""
         }]
 
         for h in req.history[-6:]:
@@ -394,7 +310,7 @@ Guidelines:
 
         return {
             "response": response.choices[0].message.content,
-            "papers": list(paper_titles_map.values())
+            "papers": paper_titles
         }
 
     except Exception as e:
